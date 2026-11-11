@@ -45,10 +45,10 @@ curl -q -fsS -4 \
 
 ## 使用方法
 
-下载本仓库中的 `cf-ddns.sh`，在服务器上运行：
+在服务器上运行：
 
 ```bash
-bash cf-ddns.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/whqijy/cf-ddns/refs/heads/main/cf-ddns.sh)
 ```
 
 首次使用可通过菜单完成 DDNS 配置，然后执行一次同步。
