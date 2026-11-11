@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ====================================================
-# 多平台轻量级 DDNS 脚本 (Cloudflare 纯Shell极速版 & 华为云 TTL=1 | 国内外双栈IP源)
+# 多平台轻量级 DDNS 脚本 (Cloudflare 纯Shell极速版 & 华为云 TTL=1 | IPv4 来源选择与持久化版)
 # 特性：内存自重构固化技术，无视启动方式、无视路径变动、支持管道直接运行
 # ====================================================
 
@@ -103,6 +103,11 @@ persist_self() {
             wakeup_daemon \
             log_msg \
             is_valid_ip \
+            get_legacy_public_ip \
+            get_direct_ipv4 \
+            read_ipv4_source \
+            choose_ipv4_source \
+            configure_ipv4_source \
             get_public_ip \
             cf_api \
             verify_and_save_cf \
@@ -271,7 +276,7 @@ is_valid_ip() {
 }
 
 # 获取本机公网 IP (国际纯文本源优先 -> 失败自动切换国内纯文本源)
-get_public_ip() {
+get_legacy_public_ip() {
     local type="$1"
     local ip=""
 
@@ -309,6 +314,114 @@ get_public_ip() {
 
     echo ""
     return 1
+}
+
+get_direct_ipv4() {
+    local ip=""
+        # IPv4 仅使用指定网卡直连检测，不回退到可能经过代理的检测源。
+        # 网卡不是 eth0 时，修改下面这一行；该设置也会随后台脚本一起保存。
+        local interface="eth0"
+        local trace=""
+        # -q 必须放在首位，避免 ~/.curlrc 中的代理、重定向等设置干扰检测。
+        # '*' 不要写成 '\*'，否则不能表示绕过所有代理。
+        if ! trace=$(curl -q -fsS -4 --interface "$interface" --noproxy '*' \
+            --max-time 10 "https://1.1.1.1/cdn-cgi/trace" 2>/dev/null); then
+            return 1
+        fi
+        # trace 是多行文本，仅提取 ip= 字段；重复字段会被后续校验拒绝。
+        ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | tr -d '\r')
+        if is_valid_ip "$ip" "A"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    return 1
+}
+
+# 独立配置文件，不受原脚本重新保存域名/API 配置影响。
+read_ipv4_source() {
+    local source=""
+    if [ -f "$CONFIG_DIR/ipv4-source.conf" ]; then
+        IFS= read -r source < "$CONFIG_DIR/ipv4-source.conf"
+    fi
+    case "$source" in
+        direct|normal) printf '%s\n' "$source" ;;
+        *) return 1 ;;
+    esac
+}
+
+choose_ipv4_source() {
+    local normal_ip="$1" direct_ip="$2" choice source tmp
+    printf '\nIPv4 检测结果：\n  1. 普通查询：%s\n  2. eth0 直连 1.1.1.1：%s\n  0. 取消，保留原 DNS 记录\n' \
+        "${normal_ip:-检测失败}" "${direct_ip:-检测失败}" >&2
+    printf '选择后会记住获取方式，今后 IP 变化时自动跟随该方式更新。\n' >&2
+    while true; do
+        IFS= read -rp '请选择 DDNS 使用的来源 [1/2/0]: ' choice || return 1
+        case "$choice" in
+            1) source=normal; [ -n "$normal_ip" ] && break ;;
+            2) source=direct; [ -n "$direct_ip" ] && break ;;
+            0) return 1 ;;
+        esac
+        printf '该选项无效或检测失败，请重新选择。\n' >&2
+    done
+    # 原子保存：后台只会读到完整的 normal 或 direct，不执行配置内容。
+    tmp=$(mktemp "$CONFIG_DIR/ipv4-source.conf.XXXXXX") || return 1
+    if ! printf '%s\n' "$source" > "$tmp" || ! mv -f "$tmp" "$CONFIG_DIR/ipv4-source.conf"; then
+        rm -f "$tmp"
+        printf '保存来源失败，已取消本次更新。\n' >&2
+        return 1
+    fi
+    rm -f "$IP_CACHE_FILE"
+    printf '已保存 IPv4 获取方式：%s\n' "$source" >&2
+    if [ "$source" = direct ]; then
+        printf '%s\n' "$direct_ip"
+    else
+        printf '%s\n' "$normal_ip"
+    fi
+}
+
+get_public_ip() {
+    local type="$1" mode="${2:-daemon}" source normal_ip direct_ip
+    if [ "$type" = AAAA ]; then
+        get_legacy_public_ip AAAA
+        return $?
+    fi
+    source=$(read_ipv4_source)
+    case "$source" in
+        direct) get_direct_ipv4; return $? ;;
+        normal) get_legacy_public_ip A; return $? ;;
+    esac
+    normal_ip=$(get_legacy_public_ip A)
+    direct_ip=$(get_direct_ipv4)
+    if [ -n "$normal_ip" ] && [ "$normal_ip" = "$direct_ip" ]; then
+        printf '%s\n' "$normal_ip"
+        return 0
+    fi
+    if [ -z "$normal_ip" ] && [ -z "$direct_ip" ]; then
+        return 1
+    fi
+    if [ "$mode" = interactive ]; then
+        choose_ipv4_source "$normal_ip" "$direct_ip"
+        return $?
+    fi
+    log_msg "IPv4 来源尚未选择，普通=${normal_ip:-失败}，直连=${direct_ip:-失败}；请运行菜单 [8] 选择，已保留原 DNS 记录"
+    return 1
+}
+
+configure_ipv4_source() {
+    local normal_ip direct_ip selected_ip
+    normal_ip=$(get_legacy_public_ip A)
+    direct_ip=$(get_direct_ipv4)
+    if [ -z "$normal_ip" ] && [ -z "$direct_ip" ]; then
+        echo '两个 IPv4 来源均检测失败，保留原有来源设置。'
+        return 1
+    fi
+    if selected_ip=$(choose_ipv4_source "$normal_ip" "$direct_ip"); then
+        echo "所选来源当前 IPv4：$selected_ip"
+        if [ -f "$CONFIG_FILE" ]; then
+            update_ddns interactive
+            wakeup_daemon
+        fi
+    fi
 }
 
 # ==================== Cloudflare 专用模块 (纯 Shell 物理隔离) ====================
@@ -785,12 +898,12 @@ update_ddns() {
     . "$CONFIG_FILE"
     PROVIDER="${PROVIDER:-cloudflare}"
 
-    current_ip=$(get_public_ip "$RECORD_TYPE")
+    current_ip=$(get_public_ip "$RECORD_TYPE" "$mode")
     date '+%Y-%m-%d %H:%M:%S' > "$LAST_CHECK_FILE"
 
     if [ -z "$current_ip" ]; then
-        log_msg "错误: 国际与国内检测源均无法获取本机公网 ${RECORD_TYPE} 地址，已保留原记录"
-        [ "$mode" = "interactive" ] && echo -e "${RED}无法获取本机公网 IP (国际/国内源均失败)，已安全保留原解析记录！${RESET}"
+        log_msg "错误: 未获取到已确认来源的 ${RECORD_TYPE} 地址（检测失败、来源待选择或用户取消），已保留原记录"
+        [ "$mode" = "interactive" ] && echo -e "${RED}未获取到已确认来源的 IP（检测失败、来源待选择或已取消；IPv4 可在菜单 [8] 选择），已安全保留原解析记录！${RESET}"
         return 1
     fi
 
@@ -1022,6 +1135,14 @@ show_status() {
         echo -e "配置状态  : ${RED}尚未配置${RESET}"
     fi
 
+    local ipv4_source
+    ipv4_source=$(read_ipv4_source)
+    case "$ipv4_source" in
+        direct) echo 'IPv4 来源 : eth0 直连 1.1.1.1（已持久化）' ;;
+        normal) echo 'IPv4 来源 : 普通查询（已持久化）' ;;
+        *) echo 'IPv4 来源 : 尚未选择，两路结果一致时更新，不一致时需选择' ;;
+    esac
+
     local cur_interval="120"
     if [ -f "$INTERVAL_FILE" ]; then
         local tmp_int
@@ -1109,9 +1230,10 @@ main_menu() {
         echo "  5. 停止后台定时任务"
         echo "  6. 查看当前状态与运行日志"
         echo "  7. 彻底卸载脚本 (停止服务并清除所有文件)"
+        echo "  8. 选择 / 更换 IPv4 获取方式（持久化）"
         echo "  0. 退出脚本"
         echo -e "${CYAN}=========================================${RESET}"
-        read -rp "请输入数字选择功能 [0-7]: " choice
+        read -rp "请输入数字选择功能 [0-8]: " choice
 
         case "$choice" in
             1) configure_ddns; pause_return ;;
@@ -1121,6 +1243,7 @@ main_menu() {
             5) stop_timer; pause_return ;;
             6) show_status; pause_return ;;
             7) uninstall_ddns; pause_return ;;
+            8) configure_ipv4_source; pause_return ;;
             0) echo "已退出。"; exit 0 ;;
             *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
         esac
